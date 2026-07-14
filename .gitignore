@@ -1,0 +1,12 @@
+# Rust
+backend/target/
+backend/trader.db
+backend/trader.db-*
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Editor/OS
+.DS_Store
+*.log
