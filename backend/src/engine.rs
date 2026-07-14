@@ -4,7 +4,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::models::{
-    Position, PositionDto, PortfolioDto, Side, Trade, TradeSource, STARTING_BALANCE,
+    Position, PositionDto, PortfolioDto, Side, SymbolStats, Trade, TradeSource, STARTING_BALANCE,
 };
 
 /// Long-only virtual spot trading ledger. Mirrors how a real Binance spot
@@ -19,6 +19,10 @@ pub struct Engine {
     pub last_trade_pnl: Option<f64>,
     pub win_count: u64,
     pub loss_count: u64,
+    pub peak_equity: f64,
+    pub max_drawdown_usd: f64,
+    pub max_drawdown_pct: f64,
+    pub symbol_stats: HashMap<String, SymbolStats>,
 }
 
 pub enum ExecuteError {
@@ -39,11 +43,50 @@ impl Engine {
             last_trade_pnl: None,
             win_count: 0,
             loss_count: 0,
+            peak_equity: STARTING_BALANCE,
+            max_drawdown_usd: 0.0,
+            max_drawdown_pct: 0.0,
+            symbol_stats: HashMap::new(),
         }
     }
 
     pub fn position_qty(&self, symbol: &str) -> f64 {
         self.positions.get(symbol).map(|p| p.qty).unwrap_or(0.0)
+    }
+
+    /// Cheap equity calc (cash + mark-to-market positions) without building
+    /// the full `PortfolioDto` — used for position sizing and drawdown
+    /// tracking, which don't need the per-position breakdown.
+    pub fn equity(&self, current_prices: &HashMap<String, f64>) -> f64 {
+        let market_value_total: f64 = self
+            .positions
+            .iter()
+            .filter(|(_, p)| p.qty > 0.0)
+            .map(|(symbol, p)| {
+                let price = *current_prices.get(symbol).unwrap_or(&p.avg_entry_price);
+                p.qty * price
+            })
+            .sum();
+        self.cash + market_value_total
+    }
+
+    /// Updates the running equity peak and worst drawdown from that peak.
+    /// Call at a steady cadence (the periodic portfolio broadcast) rather
+    /// than on every tick -- drawdown is a slow-moving risk stat, not
+    /// something that needs sub-second resolution.
+    pub fn track_drawdown(&mut self, equity: f64) {
+        if equity > self.peak_equity {
+            self.peak_equity = equity;
+        }
+        let dd_usd = self.peak_equity - equity;
+        if dd_usd > self.max_drawdown_usd {
+            self.max_drawdown_usd = dd_usd;
+            self.max_drawdown_pct = if self.peak_equity > 0.0 {
+                dd_usd / self.peak_equity * 100.0
+            } else {
+                0.0
+            };
+        }
     }
 
     pub fn execute(
@@ -137,6 +180,19 @@ impl Engine {
                 }
                 self.last_trade_pnl = Some(realized);
                 pnl = Some(realized);
+
+                let stats = self.symbol_stats.entry(symbol.to_string()).or_insert_with(|| SymbolStats {
+                    symbol: symbol.to_string(),
+                    ..Default::default()
+                });
+                stats.trade_count += 1;
+                if realized >= 0.0 {
+                    stats.win_count += 1;
+                } else {
+                    stats.loss_count += 1;
+                }
+                stats.realized_pnl += realized;
+                stats.win_rate = stats.win_count as f64 / stats.trade_count as f64 * 100.0;
             }
         }
 
@@ -200,7 +256,15 @@ impl Engine {
             } else {
                 0.0
             },
+            peak_equity: self.peak_equity,
+            max_drawdown_usd: self.max_drawdown_usd,
+            max_drawdown_pct: self.max_drawdown_pct,
             positions,
+            symbol_stats: {
+                let mut stats: Vec<SymbolStats> = self.symbol_stats.values().cloned().collect();
+                stats.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+                stats
+            },
         }
     }
 
@@ -214,5 +278,9 @@ impl Engine {
         self.last_trade_pnl = None;
         self.win_count = 0;
         self.loss_count = 0;
+        self.peak_equity = STARTING_BALANCE;
+        self.max_drawdown_usd = 0.0;
+        self.max_drawdown_pct = 0.0;
+        self.symbol_stats.clear();
     }
 }

@@ -7,11 +7,13 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AuthUser;
 use crate::models::{
     BotToggleRequest, EnabledSymbolsRequest, ManualTradeRequest, MarketTick, PortfolioDto,
-    ServerEvent, Side, StrategyStatus, Trade, TradeSource, SUPPORTED_SYMBOLS,
+    ServerEvent, Side, StrategyStatus, Trade, TradeSource, STARTING_BALANCE, SUPPORTED_SYMBOLS,
 };
 use crate::state::AppState;
+use crate::strategy::StrategyConfigPatch;
 
 #[derive(Serialize)]
 pub struct StateSnapshot {
@@ -23,9 +25,13 @@ pub struct StateSnapshot {
     pub enabled_symbols: Vec<String>,
 }
 
-pub async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateSnapshot> {
+pub async fn get_state(
+    AuthUser(user_id): AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Json<StateSnapshot> {
+    let account = state.account_for(&user_id).await;
     let prices = state.current_prices().await;
-    let portfolio = state.engine.read().await.snapshot(&prices);
+    let portfolio = account.engine.read().await.snapshot(&prices);
     let market = state.market.read().await;
     let market_list: Vec<MarketTick> = SUPPORTED_SYMBOLS
         .iter()
@@ -33,19 +39,19 @@ pub async fn get_state(State(state): State<Arc<AppState>>) -> Json<StateSnapshot
         .collect();
     drop(market);
     let trades = {
-        let engine = state.engine.read().await;
+        let engine = account.engine.read().await;
         let mut t: Vec<Trade> = engine.trades.iter().rev().take(100).cloned().collect();
         t.reverse();
         t
     };
-    let mut enabled_symbols: Vec<String> = state.enabled_symbols.read().await.iter().cloned().collect();
+    let mut enabled_symbols: Vec<String> = account.enabled_symbols.read().await.iter().cloned().collect();
     enabled_symbols.sort();
 
     Json(StateSnapshot {
         portfolio,
         market: market_list,
         trades,
-        strategy: state.strategy_status(),
+        strategy: account.strategy_status().await,
         supported_symbols: SUPPORTED_SYMBOLS.iter().map(|s| s.to_string()).collect(),
         enabled_symbols,
     })
@@ -57,23 +63,27 @@ pub struct TradesQuery {
 }
 
 pub async fn get_trades(
+    AuthUser(user_id): AuthUser,
     State(state): State<Arc<AppState>>,
     Query(q): Query<TradesQuery>,
 ) -> Json<Vec<Trade>> {
+    let account = state.account_for(&user_id).await;
     let limit = q.limit.unwrap_or(100).min(1000);
-    let engine = state.engine.read().await;
+    let engine = account.engine.read().await;
     let mut t: Vec<Trade> = engine.trades.iter().rev().take(limit).cloned().collect();
     t.reverse();
     Json(t)
 }
 
 pub async fn post_manual_trade(
+    AuthUser(user_id): AuthUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ManualTradeRequest>,
 ) -> Result<Json<Trade>, (StatusCode, String)> {
     if !SUPPORTED_SYMBOLS.contains(&req.symbol.as_str()) {
         return Err((StatusCode::BAD_REQUEST, format!("unknown symbol {}", req.symbol)));
     }
+    let account = state.account_for(&user_id).await;
     let price = state
         .market
         .read()
@@ -95,7 +105,7 @@ pub async fn post_manual_trade(
 
     let side = req.side;
     if side == Side::Sell {
-        let held = state.engine.read().await.position_qty(&req.symbol);
+        let held = account.engine.read().await.position_qty(&req.symbol);
         if qty > held + 1e-12 {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -104,7 +114,7 @@ pub async fn post_manual_trade(
         }
     }
 
-    let result = state
+    let result = account
         .engine
         .write()
         .await
@@ -112,9 +122,10 @@ pub async fn post_manual_trade(
 
     match result {
         Ok(trade) => {
-            state.persist_trade(&trade).await;
-            state.publish(ServerEvent::TradeExecuted(trade.clone()));
-            state.broadcast_portfolio().await;
+            account.persist_trade(&state.db, &trade).await;
+            account.publish(ServerEvent::TradeExecuted(trade.clone()));
+            let prices = state.current_prices().await;
+            account.broadcast_portfolio(&prices).await;
             Ok(Json(trade))
         }
         Err(_) => Err((StatusCode::BAD_REQUEST, "trade rejected: insufficient cash or position".into())),
@@ -122,16 +133,42 @@ pub async fn post_manual_trade(
 }
 
 pub async fn post_bot_toggle(
+    AuthUser(user_id): AuthUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<BotToggleRequest>,
 ) -> Json<StrategyStatus> {
-    state.bot_enabled.store(req.enabled, Ordering::Relaxed);
-    state.broadcast_strategy_status();
-    Json(state.strategy_status())
+    let account = state.account_for(&user_id).await;
+    account.bot_enabled.store(req.enabled, Ordering::Relaxed);
+    if req.enabled {
+        // Explicitly re-enabling is the user's acknowledgment of a prior
+        // kill-switch halt; clear it so the reason doesn't linger stale.
+        // If the same daily loss condition still holds, the next portfolio
+        // tick's risk check will simply trip it again.
+        account.clear_risk_halt().await;
+    }
+    account.broadcast_strategy_status().await;
+    Json(account.strategy_status().await)
 }
 
-pub async fn get_symbols(State(state): State<Arc<AppState>>) -> Json<SymbolsResponse> {
-    let mut enabled: Vec<String> = state.enabled_symbols.read().await.iter().cloned().collect();
+pub async fn post_strategy_config(
+    AuthUser(user_id): AuthUser,
+    State(state): State<Arc<AppState>>,
+    Json(patch): Json<StrategyConfigPatch>,
+) -> Result<Json<StrategyStatus>, (StatusCode, String)> {
+    let account = state.account_for(&user_id).await;
+    account
+        .update_strategy_config(patch)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+pub async fn get_symbols(
+    AuthUser(user_id): AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> Json<SymbolsResponse> {
+    let account = state.account_for(&user_id).await;
+    let mut enabled: Vec<String> = account.enabled_symbols.read().await.iter().cloned().collect();
     enabled.sort();
     Json(SymbolsResponse {
         supported: SUPPORTED_SYMBOLS.iter().map(|s| s.to_string()).collect(),
@@ -146,6 +183,7 @@ pub struct SymbolsResponse {
 }
 
 pub async fn post_symbols(
+    AuthUser(user_id): AuthUser,
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnabledSymbolsRequest>,
 ) -> Result<Json<SymbolsResponse>, (StatusCode, String)> {
@@ -157,9 +195,10 @@ pub async fn post_symbols(
         enabled.insert(symbol);
     }
 
-    state.set_enabled_symbols(enabled).await;
+    let account = state.account_for(&user_id).await;
+    account.set_enabled_symbols(enabled).await;
 
-    let mut enabled: Vec<String> = state.enabled_symbols.read().await.iter().cloned().collect();
+    let mut enabled: Vec<String> = account.enabled_symbols.read().await.iter().cloned().collect();
     enabled.sort();
     Ok(Json(SymbolsResponse {
         supported: SUPPORTED_SYMBOLS.iter().map(|s| s.to_string()).collect(),
@@ -167,10 +206,13 @@ pub async fn post_symbols(
     }))
 }
 
-pub async fn post_reset(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.engine.write().await.reset();
-    state.strategy_runtime.write().await.clear();
-    state.clear_persisted_trades().await;
-    state.broadcast_portfolio().await;
+pub async fn post_reset(AuthUser(user_id): AuthUser, State(state): State<Arc<AppState>>) -> StatusCode {
+    let account = state.account_for(&user_id).await;
+    account.engine.write().await.reset();
+    account.strategy_runtime.write().await.clear();
+    account.clear_persisted_trades(&state.db).await;
+    account.reset_risk_state(STARTING_BALANCE).await;
+    let prices = state.current_prices().await;
+    account.broadcast_portfolio(&prices).await;
     StatusCode::OK
 }

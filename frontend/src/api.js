@@ -1,11 +1,17 @@
 export const API_BASE = "http://localhost:8787";
 export const WS_URL = "ws://localhost:8787/ws";
 
+export class UnauthorizedError extends Error {}
+
 async function request(path, options) {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     ...options,
   });
+  if (res.status === 401) {
+    throw new UnauthorizedError("not logged in");
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(text || `request failed: ${res.status}`);
@@ -41,4 +47,26 @@ export function setEnabledSymbols(symbols) {
     method: "POST",
     body: JSON.stringify({ symbols }),
   });
+}
+
+export function updateStrategyConfig(patch) {
+  return request("/api/strategy/config", {
+    method: "POST",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function login(email, password) {
+  return request("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export function logout() {
+  return request("/api/auth/logout", { method: "POST" });
+}
+
+export function getMe() {
+  return request("/api/auth/me");
 }

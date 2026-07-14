@@ -2,6 +2,7 @@
 name = "trader-backend"
 version = "0.1.0"
 edition = "2021"
+default-run = "trader-backend"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -17,3 +18,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros"] }
+argon2 = "0.5"
+axum-extra = { version = "0.9", features = ["cookie"] }

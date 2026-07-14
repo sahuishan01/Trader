@@ -1,18 +1,29 @@
 use std::str::FromStr;
+use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::models::{Side, Trade, TradeSource};
 
 pub async fn init_pool(path: &str) -> sqlx::Result<SqlitePool> {
-    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))?.create_if_missing(true);
+    // Default rollback-journal mode takes an exclusive lock and fsyncs on
+    // every single commit -- fine for occasional writes, but this app
+    // inserts a row on nearly every strategy tick across every active
+    // account, and that was measured queuing up to multi-second commits on
+    // Windows. WAL lets readers run concurrently with the writer and batches
+    // fsyncs, which is the standard fix for this write pattern.
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new().max_connections(5).connect_with(opts).await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
 }
 
 #[derive(sqlx::FromRow)]
-struct TradeRow {
+struct TransactionRow {
     id: String,
     symbol: String,
     side: String,
@@ -24,9 +35,9 @@ struct TradeRow {
     timestamp: i64,
 }
 
-impl TryFrom<TradeRow> for Trade {
+impl TryFrom<TransactionRow> for Trade {
     type Error = String;
-    fn try_from(row: TradeRow) -> Result<Self, Self::Error> {
+    fn try_from(row: TransactionRow) -> Result<Self, Self::Error> {
         Ok(Trade {
             id: row.id,
             symbol: row.symbol,
@@ -41,12 +52,13 @@ impl TryFrom<TradeRow> for Trade {
     }
 }
 
-pub async fn insert_paper_trade(pool: &SqlitePool, trade: &Trade) -> sqlx::Result<()> {
+pub async fn insert_transaction(pool: &SqlitePool, user_id: &str, trade: &Trade) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO paper_trades (id, symbol, side, qty, price, value, pnl, source, timestamp)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO transactions (id, user_id, symbol, side, qty, price, value, pnl, source, timestamp)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&trade.id)
+    .bind(user_id)
     .bind(&trade.symbol)
     .bind(trade.side.as_str())
     .bind(trade.qty)
@@ -60,11 +72,12 @@ pub async fn insert_paper_trade(pool: &SqlitePool, trade: &Trade) -> sqlx::Resul
     Ok(())
 }
 
-pub async fn load_paper_trades(pool: &SqlitePool) -> sqlx::Result<Vec<Trade>> {
-    let rows = sqlx::query_as::<_, TradeRow>(
+pub async fn load_transactions(pool: &SqlitePool, user_id: &str) -> sqlx::Result<Vec<Trade>> {
+    let rows = sqlx::query_as::<_, TransactionRow>(
         "SELECT id, symbol, side, qty, price, value, pnl, source, timestamp
-         FROM paper_trades ORDER BY timestamp ASC, rowid ASC",
+         FROM transactions WHERE user_id = ? ORDER BY timestamp ASC, rowid ASC",
     )
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
 
@@ -73,14 +86,17 @@ pub async fn load_paper_trades(pool: &SqlitePool) -> sqlx::Result<Vec<Trade>> {
         .filter_map(|row| match Trade::try_from(row) {
             Ok(trade) => Some(trade),
             Err(e) => {
-                tracing::error!("skipping malformed persisted trade: {e}");
+                tracing::error!("skipping malformed persisted transaction: {e}");
                 None
             }
         })
         .collect())
 }
 
-pub async fn clear_paper_trades(pool: &SqlitePool) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM paper_trades").execute(pool).await?;
+pub async fn clear_transactions(pool: &SqlitePool, user_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM transactions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }

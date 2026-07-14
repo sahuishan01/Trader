@@ -10,3 +10,6 @@ frontend/dist/
 # Editor/OS
 .DS_Store
 *.log
+
+# Claude Code local runtime state
+.claude/

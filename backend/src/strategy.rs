@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::models::{Side, TradeSource};
-use crate::state::AppState;
+use crate::state::{AppState, UserAccount};
 
 /// Rule-based micro-scalping strategy:
 ///
@@ -45,6 +45,158 @@ pub struct StrategyConfig {
     pub sl_atr_mult: f64,
     pub trail_activate_atr_mult: f64,
     pub trail_atr_mult: f64,
+
+    // Account-level risk controls.
+    pub max_concurrent_positions: u32,
+    pub max_exposure_pct: f64,
+    pub daily_loss_limit_pct: f64,
+}
+
+/// Partial update for `StrategyConfig` — every field optional so the API
+/// can patch just the parameters the user changed. Ranges are sanity
+/// bounds, not tuned recommendations.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct StrategyConfigPatch {
+    pub ema_fast_period: Option<u32>,
+    pub ema_slow_period: Option<u32>,
+    pub imbalance_threshold: Option<f64>,
+    pub max_spread_bps: Option<f64>,
+    pub position_size_pct: Option<f64>,
+    pub cooldown_ms: Option<i64>,
+    pub max_cooldown_ms: Option<i64>,
+    pub loss_streak_cooldown_mult: Option<f64>,
+    pub min_hold_ms: Option<i64>,
+    pub atr_period: Option<u32>,
+    pub rsi_period: Option<u32>,
+    pub rsi_min: Option<f64>,
+    pub rsi_max: Option<f64>,
+    pub tp_atr_mult: Option<f64>,
+    pub sl_atr_mult: Option<f64>,
+    pub trail_activate_atr_mult: Option<f64>,
+    pub trail_atr_mult: Option<f64>,
+    pub max_concurrent_positions: Option<u32>,
+    pub max_exposure_pct: Option<f64>,
+    pub daily_loss_limit_pct: Option<f64>,
+}
+
+impl StrategyConfig {
+    pub fn apply_patch(&self, patch: &StrategyConfigPatch) -> Result<StrategyConfig, String> {
+        let mut next = *self;
+        if let Some(v) = patch.ema_fast_period {
+            next.ema_fast_period = v;
+        }
+        if let Some(v) = patch.ema_slow_period {
+            next.ema_slow_period = v;
+        }
+        if let Some(v) = patch.imbalance_threshold {
+            next.imbalance_threshold = v;
+        }
+        if let Some(v) = patch.max_spread_bps {
+            next.max_spread_bps = v;
+        }
+        if let Some(v) = patch.position_size_pct {
+            next.position_size_pct = v;
+        }
+        if let Some(v) = patch.cooldown_ms {
+            next.cooldown_ms = v;
+        }
+        if let Some(v) = patch.max_cooldown_ms {
+            next.max_cooldown_ms = v;
+        }
+        if let Some(v) = patch.loss_streak_cooldown_mult {
+            next.loss_streak_cooldown_mult = v;
+        }
+        if let Some(v) = patch.min_hold_ms {
+            next.min_hold_ms = v;
+        }
+        if let Some(v) = patch.atr_period {
+            next.atr_period = v;
+        }
+        if let Some(v) = patch.rsi_period {
+            next.rsi_period = v;
+        }
+        if let Some(v) = patch.rsi_min {
+            next.rsi_min = v;
+        }
+        if let Some(v) = patch.rsi_max {
+            next.rsi_max = v;
+        }
+        if let Some(v) = patch.tp_atr_mult {
+            next.tp_atr_mult = v;
+        }
+        if let Some(v) = patch.sl_atr_mult {
+            next.sl_atr_mult = v;
+        }
+        if let Some(v) = patch.trail_activate_atr_mult {
+            next.trail_activate_atr_mult = v;
+        }
+        if let Some(v) = patch.trail_atr_mult {
+            next.trail_atr_mult = v;
+        }
+        if let Some(v) = patch.max_concurrent_positions {
+            next.max_concurrent_positions = v;
+        }
+        if let Some(v) = patch.max_exposure_pct {
+            next.max_exposure_pct = v;
+        }
+        if let Some(v) = patch.daily_loss_limit_pct {
+            next.daily_loss_limit_pct = v;
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.ema_fast_period == 0 || self.ema_slow_period == 0 {
+            return Err("EMA periods must be positive".into());
+        }
+        if self.ema_fast_period >= self.ema_slow_period {
+            return Err("EMA fast period must be less than slow period".into());
+        }
+        if !(0.0..=1.0).contains(&self.imbalance_threshold) {
+            return Err("imbalance_threshold must be between 0 and 1".into());
+        }
+        if self.max_spread_bps <= 0.0 {
+            return Err("max_spread_bps must be positive".into());
+        }
+        if !(0.0..=1.0).contains(&self.position_size_pct) || self.position_size_pct <= 0.0 {
+            return Err("position_size_pct must be between 0 (exclusive) and 1".into());
+        }
+        if self.cooldown_ms < 0 || self.max_cooldown_ms < self.cooldown_ms {
+            return Err("cooldowns must be non-negative and max >= base".into());
+        }
+        if self.loss_streak_cooldown_mult < 1.0 {
+            return Err("loss_streak_cooldown_mult must be >= 1".into());
+        }
+        if self.min_hold_ms < 0 {
+            return Err("min_hold_ms must be non-negative".into());
+        }
+        if self.atr_period == 0 || self.rsi_period == 0 {
+            return Err("atr_period and rsi_period must be positive".into());
+        }
+        if !(0.0..=100.0).contains(&self.rsi_min) || !(0.0..=100.0).contains(&self.rsi_max) {
+            return Err("RSI bounds must be between 0 and 100".into());
+        }
+        if self.rsi_min >= self.rsi_max {
+            return Err("rsi_min must be less than rsi_max".into());
+        }
+        if self.tp_atr_mult <= 0.0 || self.sl_atr_mult <= 0.0 {
+            return Err("tp_atr_mult and sl_atr_mult must be positive".into());
+        }
+        if self.trail_activate_atr_mult <= 0.0 || self.trail_atr_mult <= 0.0 {
+            return Err("trail multipliers must be positive".into());
+        }
+        if self.max_concurrent_positions == 0 {
+            return Err("max_concurrent_positions must be at least 1".into());
+        }
+        if !(0.0..=1.0).contains(&self.max_exposure_pct) || self.max_exposure_pct <= 0.0 {
+            return Err("max_exposure_pct must be between 0 (exclusive) and 1".into());
+        }
+        if self.daily_loss_limit_pct <= 0.0 || self.daily_loss_limit_pct > 100.0 {
+            return Err("daily_loss_limit_pct must be between 0 (exclusive) and 100".into());
+        }
+        Ok(())
+    }
 }
 
 impl Default for StrategyConfig {
@@ -69,6 +221,10 @@ impl Default for StrategyConfig {
             sl_atr_mult: 1.1,
             trail_activate_atr_mult: 1.2,
             trail_atr_mult: 0.9,
+
+            max_concurrent_positions: 4,
+            max_exposure_pct: 0.25,
+            daily_loss_limit_pct: 8.0,
         }
     }
 }
@@ -169,14 +325,14 @@ impl SymbolRuntime {
 pub type StrategyRuntime = HashMap<String, SymbolRuntime>;
 
 pub async fn on_book_update(
-    state: &Arc<AppState>,
+    account: &Arc<UserAccount>,
     symbol: &str,
     bid: f64,
     ask: f64,
     bid_qty: f64,
     ask_qty: f64,
 ) {
-    let mut runtime = state.strategy_runtime.write().await;
+    let mut runtime = account.strategy_runtime.write().await;
     let r = runtime.entry(symbol.to_string()).or_default();
     r.bid = bid;
     r.ask = ask;
@@ -195,11 +351,17 @@ struct Indicators {
     consecutive_losses: u32,
 }
 
-pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_ms: i64) {
-    let cfg = state.strategy_config;
+pub async fn on_price_tick(
+    state: &Arc<AppState>,
+    account: &Arc<UserAccount>,
+    symbol: &str,
+    price: f64,
+    ts_ms: i64,
+) {
+    let cfg = *account.strategy_config.read().await;
 
     let indicators = {
-        let mut runtime = state.strategy_runtime.write().await;
+        let mut runtime = account.strategy_runtime.write().await;
         let r = runtime.entry(symbol.to_string()).or_default();
         let (crossed_bullish, crossed_bearish) = r.update(price, &cfg);
 
@@ -227,7 +389,7 @@ pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_m
         }
     };
 
-    let position = state.engine.read().await.positions.get(symbol).cloned();
+    let position = account.engine.read().await.positions.get(symbol).cloned();
 
     match position {
         None => {
@@ -235,7 +397,7 @@ pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_m
             // stops new positions from opening; an already-open one (below)
             // is still managed to a clean exit rather than being abandoned
             // mid-trade.
-            if !state.bot_enabled.load(Ordering::Relaxed) || !state.is_symbol_enabled(symbol).await {
+            if !account.bot_enabled.load(Ordering::Relaxed) || !account.is_symbol_enabled(symbol).await {
                 return;
             }
             let (Some(atr), Some(rsi)) = (indicators.atr.filter(|a| *a > 0.0), indicators.rsi) else {
@@ -254,20 +416,28 @@ pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_m
                 && indicators.since_entry_ms > effective_cooldown
             {
                 let prices = state.current_prices().await;
-                let equity = state.engine.read().await.snapshot(&prices).equity;
+                let (equity, open_positions) = {
+                    let engine = account.engine.read().await;
+                    (engine.equity(&prices), engine.positions.len())
+                };
                 let notional = equity * cfg.position_size_pct;
                 let qty = notional / price;
-                if qty > 0.0 && notional > 10.0 {
-                    let trade_result = state
+                let within_exposure_cap = equity > 0.0 && notional / equity <= cfg.max_exposure_pct;
+                if qty > 0.0
+                    && notional > 10.0
+                    && open_positions < cfg.max_concurrent_positions as usize
+                    && within_exposure_cap
+                {
+                    let trade_result = account
                         .engine
                         .write()
                         .await
                         .execute(symbol, Side::Buy, qty, price, TradeSource::Bot);
                     if let Ok(trade) = trade_result {
-                        state.persist_trade(&trade).await;
-                        state.publish(crate::models::ServerEvent::TradeExecuted(trade));
-                        state.broadcast_portfolio().await;
-                        let mut runtime = state.strategy_runtime.write().await;
+                        account.persist_trade(&state.db, &trade).await;
+                        account.publish(crate::models::ServerEvent::TradeExecuted(trade));
+                        account.broadcast_portfolio(&prices).await;
+                        let mut runtime = account.strategy_runtime.write().await;
                         if let Some(r) = runtime.get_mut(symbol) {
                             r.last_entry_ms = ts_ms;
                             r.entry_atr = atr;
@@ -281,7 +451,7 @@ pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_m
         }
         Some(pos) if pos.qty > 0.0 => {
             let managed = {
-                let mut runtime = state.strategy_runtime.write().await;
+                let mut runtime = account.strategy_runtime.write().await;
                 let r = runtime.entry(symbol.to_string()).or_default();
                 r.peak_price = r.peak_price.max(price);
 
@@ -320,7 +490,7 @@ pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_m
             let stop_loss_hit = price <= effective_sl;
 
             if take_profit_hit || stop_loss_hit || indicators.crossed_bearish {
-                let trade_result = state.engine.write().await.execute(
+                let trade_result = account.engine.write().await.execute(
                     symbol,
                     Side::Sell,
                     pos.qty,
@@ -328,11 +498,12 @@ pub async fn on_price_tick(state: &Arc<AppState>, symbol: &str, price: f64, ts_m
                     TradeSource::Bot,
                 );
                 if let Ok(trade) = trade_result {
-                    state.persist_trade(&trade).await;
+                    account.persist_trade(&state.db, &trade).await;
                     let pnl = trade.pnl;
-                    state.publish(crate::models::ServerEvent::TradeExecuted(trade));
-                    state.broadcast_portfolio().await;
-                    let mut runtime = state.strategy_runtime.write().await;
+                    account.publish(crate::models::ServerEvent::TradeExecuted(trade));
+                    let prices = state.current_prices().await;
+                    account.broadcast_portfolio(&prices).await;
+                    let mut runtime = account.strategy_runtime.write().await;
                     if let Some(r) = runtime.get_mut(symbol) {
                         match pnl {
                             Some(p) if p >= 0.0 => r.consecutive_losses = 0,

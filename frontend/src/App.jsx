@@ -7,12 +7,17 @@ import TradesTable from "./components/TradesTable";
 import BotControls from "./components/BotControls";
 import ManualTradeForm from "./components/ManualTradeForm";
 import MarketSelector from "./components/MarketSelector";
+import SymbolStatsTable from "./components/SymbolStatsTable";
+import Login from "./components/Login";
 import {
   getState,
+  getMe,
+  logout,
   placeManualTrade,
   toggleBot,
   resetPortfolio,
   setEnabledSymbols as apiSetEnabledSymbols,
+  UnauthorizedError,
   WS_URL,
 } from "./api";
 import { formatCompactUsd, formatUsd, formatPct } from "./format";
@@ -20,11 +25,32 @@ import "./App.css";
 
 const MAX_TRADES = 200;
 const MAX_EQUITY_POINTS = 500;
+const MAX_HISTORY_POINTS = 120;
 
 export default function App() {
+  // undefined = still checking for an existing session, null = logged out.
+  const [user, setUser] = useState(undefined);
+
+  useEffect(() => {
+    let cancelled = false;
+    getMe()
+      .then((u) => !cancelled && setUser(u))
+      .catch(() => !cancelled && setUser(null));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (user === undefined) return null;
+  if (user === null) return <Login onLoggedIn={setUser} />;
+  return <Dashboard user={user} onLogout={() => logout().finally(() => setUser(null))} />;
+}
+
+function Dashboard({ user, onLogout }) {
   const [connected, setConnected] = useState(false);
   const [portfolio, setPortfolio] = useState(null);
   const [market, setMarket] = useState({});
+  const [priceHistory, setPriceHistory] = useState({});
   const [trades, setTrades] = useState([]);
   const [strategy, setStrategy] = useState(null);
   const [equityHistory, setEquityHistory] = useState([]);
@@ -40,6 +66,13 @@ export default function App() {
     switch (event.type) {
       case "price_tick":
         setMarket((prev) => ({ ...prev, [event.data.symbol]: event.data }));
+        setPriceHistory((prev) => {
+          const existing = prev[event.data.symbol] ?? [];
+          const next = [...existing, { t: event.data.timestamp, price: event.data.price }].slice(
+            -MAX_HISTORY_POINTS
+          );
+          return { ...prev, [event.data.symbol]: next };
+        });
         break;
       case "trade":
         setTrades((prev) =>
@@ -80,11 +113,17 @@ export default function App() {
         setSupportedSymbols(snapshot.supported_symbols);
         setEnabledSymbols(snapshot.enabled_symbols);
       })
-      .catch((err) => setLoadError(err.message));
+      .catch((err) => {
+        if (err instanceof UnauthorizedError) {
+          onLogout();
+          return;
+        }
+        setLoadError(err.message);
+      });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [onLogout]);
 
   useEffect(() => {
     function connect() {
@@ -150,9 +189,15 @@ export default function App() {
           <h1>Virtual HFT Trading Desk</h1>
           <p className="subtitle">Paper trading on live Binance prices — no real funds, no API key required.</p>
         </div>
-        <div className={`conn-pill ${connected ? "conn-live" : "conn-down"}`}>
-          <span className="conn-dot" />
-          {connected ? "Live" : "Reconnecting…"}
+        <div className="header-right">
+          <div className={`conn-pill ${connected ? "conn-live" : "conn-down"}`}>
+            <span className="conn-dot" />
+            {connected ? "Live" : "Reconnecting…"}
+          </div>
+          <span className="user-email text-muted">{user.email}</span>
+          <button className="btn btn-ghost" onClick={onLogout}>
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -191,16 +236,24 @@ export default function App() {
             value={`${p.win_rate.toFixed(1)}%`}
             sublabel={`${p.win_count}W / ${p.loss_count}L · ${p.trade_count} trades`}
           />
+          <StatTile
+            label="Max drawdown"
+            value={formatPct(-p.max_drawdown_pct, { signed: false })}
+            sublabel={`${formatUsd(p.max_drawdown_usd)} from peak ${formatCompactUsd(p.peak_equity)}`}
+            tone={p.max_drawdown_pct > 0 ? "critical" : "neutral"}
+          />
         </section>
       )}
 
-      <section className="grid-2">
-        <EquityChart data={equityHistory} />
-        <PriceTicker symbols={enabledSymbols} supportedSymbols={supportedSymbols} market={market} />
-      </section>
+      <PriceTicker
+        supportedSymbols={supportedSymbols}
+        enabledSymbols={enabledSymbols}
+        market={market}
+        history={priceHistory}
+      />
 
       <section className="grid-2">
-        <PositionsTable positions={p?.positions ?? []} supportedSymbols={supportedSymbols} />
+        <EquityChart data={equityHistory} />
         <div className="stack">
           <BotControls strategy={strategy} onToggle={handleToggle} onReset={handleReset} busy={busy} />
           <MarketSelector
@@ -213,7 +266,7 @@ export default function App() {
       </section>
 
       <section className="grid-2">
-        <TradesTable trades={trades} />
+        <PositionsTable positions={p?.positions ?? []} supportedSymbols={supportedSymbols} />
         <ManualTradeForm
           cashBalance={p?.cash_balance ?? 0}
           positions={p?.positions ?? []}
@@ -221,6 +274,10 @@ export default function App() {
           onSubmit={placeManualTrade}
         />
       </section>
+
+      <SymbolStatsTable stats={p?.symbol_stats ?? []} supportedSymbols={supportedSymbols} />
+
+      <TradesTable trades={trades} />
     </div>
   );
 }

@@ -124,7 +124,23 @@ pub struct PortfolioDto {
     pub win_count: u64,
     pub loss_count: u64,
     pub win_rate: f64,
+    pub peak_equity: f64,
+    pub max_drawdown_usd: f64,
+    pub max_drawdown_pct: f64,
     pub positions: Vec<PositionDto>,
+    pub symbol_stats: Vec<SymbolStats>,
+}
+
+/// Per-symbol realized-trade breakdown, accumulated incrementally as sells
+/// book P&L (not recomputed from full trade history on every snapshot).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SymbolStats {
+    pub symbol: String,
+    pub trade_count: u64,
+    pub win_count: u64,
+    pub loss_count: u64,
+    pub realized_pnl: f64,
+    pub win_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +172,13 @@ pub struct StrategyStatus {
     pub trail_atr_mult: f64,
     pub cooldown_ms: i64,
     pub max_cooldown_ms: i64,
+    pub loss_streak_cooldown_mult: f64,
+    pub min_hold_ms: i64,
+    pub max_concurrent_positions: u32,
+    pub max_exposure_pct: f64,
+    pub daily_loss_limit_pct: f64,
+    pub risk_halted: bool,
+    pub risk_halt_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

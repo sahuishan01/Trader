@@ -82,7 +82,9 @@ async fn handle_book_ticker(state: &Arc<AppState>, data: &Value) {
         return;
     }
 
-    strategy::on_book_update(state, symbol, bid, ask, bid_qty, ask_qty).await;
+    for account in state.active_accounts().await {
+        strategy::on_book_update(&account, symbol, bid, ask, bid_qty, ask_qty).await;
+    }
 
     let mut market = state.market.write().await;
     let entry = market.entry(symbol.to_string()).or_insert_with(|| MarketTick {
@@ -127,7 +129,9 @@ async fn handle_trade(
         entry.timestamp = ts_ms;
     }
 
-    strategy::on_price_tick(state, symbol, price, ts_ms).await;
+    for account in state.active_accounts().await {
+        strategy::on_price_tick(state, &account, symbol, price, ts_ms).await;
+    }
 
     // Throttle UI price broadcasts to ~10/s per symbol; the strategy above
     // still sees every single tick for accurate signal timing.
@@ -135,7 +139,7 @@ async fn handle_trade(
     if ts_ms - last >= 100 {
         last_broadcast_ms.insert(symbol.to_string(), ts_ms);
         if let Some(tick) = state.market.read().await.get(symbol).cloned() {
-            state.publish(ServerEvent::PriceTick(tick));
+            state.publish_market(ServerEvent::PriceTick(tick));
         }
     }
 }
